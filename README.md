@@ -18,6 +18,7 @@ K47-Keyword/
 └── media/
 ├── demo.mp4
 └── images/
+<img width="212" height="326" alt="image" src="https://github.com/user-attachments/assets/07c39131-9c39-4bdb-8dae-f2493e4676ac" />
 
 ---
 
