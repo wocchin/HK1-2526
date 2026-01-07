@@ -1,0 +1,178 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <FirebaseESP32.h>
+#include <PZEM004Tv30.h>
+#include <DHT.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ==================== CẤU HÌNH CỦA ANH ====================
+#define WIFI_SSID       "Duc"
+#define WIFI_PASSWORD   "07032005"
+#define API_KEY         "AIzaSyDmsxUiY_35EduINZwaoPJdbkNStrSc_6s"
+#define DATABASE_URL    "https://tu-dien-3943b-default-rtdb.asia-southeast1.firebasedatabase.app/"
+
+// OLED
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// PZEM004T v3.0 + DHT11
+PZEM004Tv30 pzem(Serial2, 16, 17);   // RX=16, TX=17
+#define DHT_PIN  4
+#define DHT_TYPE DHT11
+DHT dht(DHT_PIN, DHT_TYPE);
+
+// Relay + Buzzer + 3 ĐÈN LED BÁO
+#define RELAY_MAIN   25
+#define RELAY_FAN    26
+#define BUZZER       27
+#define LED_GREEN    32   // Bình thường
+#define LED_YELLOW   33   // Cảnh báo
+#define LED_RED      34   // Nguy hiểm / Đã ngắt
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// Ngưỡng cảnh báo (có thể thay đổi từ app sau)
+float currentWarn = 8.0;   // >8A  → vàng
+float currentDanger = 10.0; // >10A → đỏ
+float currentCut = 12.0;    // >12A → tự ngắt + buzzer
+
+float tempWarn = 50.0;     // >50°C → vàng
+float tempDanger = 60.0;   // >60°C → đỏ
+float tempCut = 70.0;      // >70°C → tự ngắt
+
+void tokenStatusCallback(TokenInfo info) {}
+
+void setup() {
+  // === LOẠI BỎ RÁC TỪ PZEM ===
+  Serial2.end();
+  delay(200);
+  Serial2.begin(9600, SERIAL_8N1, 16, 17);
+
+  Serial.begin(115200);
+  while (!Serial) delay(10);
+
+  dht.begin();
+
+  // OLED
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED lỗi!");
+    for(;;);
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(10,25);
+  display.println("TỦ ĐIỆN SCADA 2025");
+  display.display();
+  delay(2000);
+
+  // Khởi tạo chân
+  pinMode(RELAY_MAIN, OUTPUT); digitalWrite(RELAY_MAIN, HIGH);
+  pinMode(RELAY_FAN,  OUTPUT); digitalWrite(RELAY_FAN,  HIGH);
+  pinMode(BUZZER,     OUTPUT); digitalWrite(BUZZER,     LOW);
+  pinMode(LED_GREEN,  OUTPUT); digitalWrite(LED_GREEN,  LOW);
+  pinMode(LED_YELLOW, OUTPUT); digitalWrite(LED_YELLOW, LOW);
+  pinMode(LED_RED,    OUTPUT); digitalWrite(LED_RED,    LOW);
+
+  // Kết nối WiFi + Firebase
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) delay(500);
+  Serial.println("WiFi OK: " + WiFi.localIP().toString());
+
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  config.token_status_callback = tokenStatusCallback;
+  config.signer.tokens.legacy_token = API_KEY;
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  display.clearDisplay();
+  display.setCursor(5,20);
+  display.println("FIREBASE OK!");
+  display.display();
+  delay(1500);
+}
+
+void updateLEDs(int level) {
+  digitalWrite(LED_GREEN,   level == 0 ? HIGH : LOW);
+  digitalWrite(LED_YELLOW, level == 1 ? HIGH : LOW);
+  digitalWrite(LED_RED,    level >= 2 ? HIGH : LOW);
+}
+
+void loop() {
+  static unsigned long last = 0;
+  if (millis() - last < 1500) return;
+  last = millis();
+
+  // === ĐỌC PZEM004T – BÂY GIỜ ĐO ĐƯỢC 100% ===
+  float v = pzem.voltage();     if (isnan(v)) v = 0;
+  float i = pzem.current();     if (isnan(i)) i = 0;
+  float p = pzem.power();       if (isnan(p)) p = 0;
+  float pf = pzem.pf();         if (isnan(pf)) pf = 0;
+
+  float t = dht.readTemperature(); if (isnan(t)) t = 0;
+  float h = dht.readHumidity();     if (isnan(h)) h = 0;
+
+  // === TÍNH MỨC CẢNH BÁO ===
+  int level = 0;
+  if (i >= currentCut || t >= tempCut)       level = 3;
+  else if (i >= currentDanger || t >= tempDanger) level = 2;
+  else if (i >= currentWarn || t >= tempWarn)    level = 1;
+
+  // === CẬP NHẬT 3 ĐÈN LED THẬT ===
+  updateLEDs(level);
+
+  // === TỰ ĐỘNG NGẮT + BUZZER KHI MỨC 3 ===
+  if (level == 3) {
+    digitalWrite(RELAY_MAIN, LOW);
+    digitalWrite(BUZZER, HIGH);
+  } else {
+    digitalWrite(BUZZER, LOW);
+  }
+
+  // === ĐỌC LỆNH TỪ APP (nếu muốn bật lại thủ công) ===
+  bool appMain = true, appFan = false;
+  if (Firebase.getBool(fbdo, "/control/main_power")) appMain = fbdo.boolData();
+  if (Firebase.getBool(fbdo, "/control/fan"))        appFan = fbdo.boolData();
+
+  // Ưu tiên: mức 3 thì KHÓA không cho bật lại
+  if (level == 3) appMain = false;
+
+  digitalWrite(RELAY_MAIN, appMain ? HIGH : LOW);
+  digitalWrite(RELAY_FAN,  appFan  ? HIGH : LOW);
+
+  // Gửi dữ liệu lên Firebase
+  Firebase.setFloat(fbdo, "/sensor/voltage", v);
+  Firebase.setFloat(fbdo, "/sensor/current", i);
+  Firebase.setFloat(fbdo, "/sensor/power",   p);
+  Firebase.setFloat(fbdo, "/sensor/pf",      pf);
+  Firebase.setFloat(fbdo, "/sensor/temp",    t);
+  Firebase.setFloat(fbdo, "/sensor/humi",    h);
+  Firebase.setBool(fbdo,  "/status/main_power", appMain && level != 3);
+  Firebase.setBool(fbdo,  "/status/fan", appFan);
+
+  // === HIỂN THỊ OLED ĐẸP LUNG LINH ===
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0,0);   display.printf("V: %.1fV", v);
+  display.setCursor(0,12);  display.printf("I: %.2fA", i);
+  display.setCursor(0,24);  display.printf("P: %.0fW", p);
+  display.setCursor(0,36);  display.printf("T: %.1fC", t);
+  display.setCursor(0,48);  display.printf("H: %.0f%%", h);
+
+  // Trạng thái mức
+  display.setCursor(80, 24);
+  if (level == 0) display.print("BINH THUONG");
+  else if (level == 1) display.print("CANH BAO");
+  else if (level == 2) display.print("NGUY HIEM");
+  else display.print("DA NGAT!");
+
+  display.display();
+
+  Serial.printf("V=%.1f I=%.2f P=%.0f T=%.1f Level=%d\n", v, i, p, t, level);
+}
